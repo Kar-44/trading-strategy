@@ -1,273 +1,156 @@
 import numpy as np
 import pandas as pd
+import yfinance as yf
 import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
 
-
-# =====================================================================
-# STEP 1: DATA LOADER (Synthetic Cointegrated Pair + Real Data Option)
-# =====================================================================
-def get_market_data(n_days=1500, seed=42):
+# 1. Real market data loading from yfinance
+def fetch_pair_data(ticker_x="XOM", ticker_y="CVX", start="2018-01-01", end="2026-11-01"):
     """
-    Generates two realistic, cointegrated price series (Asset X and Asset Y)
-    with a slowly drifting hedge ratio so we can test our dynamic regression.
+    :param ticker_x:
+    :param ticker_y:
+    :param start:
+    :param end:
+    Downloads historical financial data from Yahoo Finance, by Default it is data of a
+    pair ExxonMobil and Chevron, economically linked energy giants. Between 2018-01-01 and 2026-11-01
     """
-    np.random.seed(seed)
-    dates = pd.date_range(start="2020-01-01", periods=n_days, freq="B")
+    print(f"Downloading data for {ticker_x} and {ticker_y}...")
+    raw = yf.download([ticker_x, ticker_y], start=start, end=end, auto_adjust=True, progress=False)
 
-    # Simulate Asset X as a geometric random walk (like a benchmark ETF)
-    returns_x = np.random.normal(loc=0.0003, scale=0.012, size=n_days)
-    price_x = 100 * np.exp(np.cumsum(returns_x))
+    # Extract Close prices from different yfinance versions, removing missing values to prevent errors
+    close_prices = raw["Close"] if "Close" in raw else raw df = pd.DataFrame({
+        "Price_X": close_prices[ticker_x],
+        "Price_Y": close_prices[ticker_y]
+    }).dropna()
 
-    # Create a slowly drifting true hedge ratio (beta) between 1.1 and 1.4
-    true_beta = 1.25 + 0.15 * np.sin(np.linspace(0, 3 * np.pi, n_days))
-
-    # Simulate a mean-reverting spread (Ornstein-Uhlenbeck process)
-    spread_noise = np.zeros(n_days)
-    theta = 0.08  # Speed of mean reversion
-    for t in range(1, n_days):
-        spread_noise[t] = (1 - theta) * spread_noise[t - 1] + np.random.normal(0, 0.8)
-
-    # Asset Y is driven by Asset X, the drifting beta, and the mean-reverting spread
-    price_y = 15.0 + true_beta * price_x + spread_noise
-
-    df = pd.DataFrame({"Asset_X": price_x, "Asset_Y": price_y}, index=dates)
-
-    # -----------------------------------------------------------------
-    # OPTIONAL: To use real data, un/comment the lines below:
-    import yfinance as yf
-    raw = yf.download(["KO", "PEP"], start="2019-01-01", end="2026-01-01")["Close"]
-    df = raw.rename(columns={"KO": "Asset_X", "PEP": "Asset_Y"}).dropna()
-    # -----------------------------------------------------------------
+    # Convert to Log-Prices so beta represents percentage elasticity
+    df["Log_X"] = np.log(df["Price_X"])
+    df["Log_Y"] = np.log(df["Price_Y"])
 
     return df
 
-
-# =====================================================================
-# STEP 2: CUSTOM ROLLING RIDGE REGRESSION (The "Custom Regression Curve")
-# =====================================================================
-def rolling_weighted_ridge_regression(x_series, y_series, window=60, l2_penalty=1.0, half_life=20):
+# 2. Custom rolling Ridge regression on Log-Prices
+def rolling_weighted_ridge_reg(x_series, y_series, window=60, l2_penalty=0.5, half_life=20):
     """
-    Fits a custom rolling linear regression: Y = alpha + beta * X
-    Uses Exponentially Weighted Least Squares + L2 (Ridge) Regularization.
-
-    1. Strictly uses [t - window : t] data (prevents Look-ahead Bias).
-    2. Exponential weights prioritize recent market regime over old data.
-    3. L2 penalty prevents beta from exploding during market crashes.
+    :param x_series:
+    :param y_series:
+    :param window:
+    :param l2_penalty:
+    :param half_life:
+    :return:
+    Fits Log_Y = alpha + beta * Log_X using only data within the rolling window.
+    Includes exponential time-decay and L2 (Ridge) regularization
     """
-    n = len(x_series)
+    # Set
+    n=len(x_series)
     alphas = np.full(n, np.nan)
     betas = np.full(n, np.nan)
 
     x_vals = x_series.values
     y_vals = y_series.values
 
-    # Pre-calculate exponential decay weights for the rolling window
-    # Older observations get smaller weights; the newest observation gets weight = 1.0
+    # Exponential weights, ie. recent days matter more than early ones
+    # ==============
+    # Potentially to change for more optimized option that does not create a giant matrix
     decay_rate = np.log(2) / half_life
-    weights = np.exp(-decay_rate * np.arange(window - 1, -1, -1))
-    W = np.diag(weights)  # Diagonal weight matrix
+    weights = np.exp(-decay_rate * np.arange(window -1, -1, -1)) # np.arange(start, stop, step)
+    W = np.diag(weights) # turn 1D array into a Matrix with diagonal weights and 0s elsewhere
 
-    # Regularization matrix (we penalize the slope 'beta', not the intercept 'alpha')
+    # Penalize slope to prevent giant hedge ratios
     reg_matrix = np.array([[0.0, 0.0],
-                           [0.0, l2_penalty]])
+                            [0.0, l2_penalty]])
 
-    # Loop strictly forward in time starting once we have enough history
-    for t in range(window - 1, n):
-        # Slice ONLY historical data up to and including day t
-        x_win = x_vals[t - window + 1: t + 1]
-        y_win = y_vals[t - window + 1: t + 1]
+    for t in range(window-1, n):
+        x_win = x_vals[t - window+1 : t+1]
+        y_win = y_vals[t - window+1 : t+1]
 
-        # Design matrix X with a column of 1s for the intercept (alpha)
         X_mat = np.column_stack([np.ones(window), x_win])
-
-        # Closed-form Weighted Ridge Regression solution:
-        # theta = (X^T * W * X + lambda * I)^(-1) * (X^T * W * Y)
         Xt_W = X_mat.T @ W
-        lhs = Xt_W @ X_mat + reg_matrix
-        rhs = Xt_W @ y_win
 
-        # Solve linear system (faster and more numerically stable than matrix inversion)
-        alpha_t, beta_t = np.linalg.solve(lhs, rhs)
-
+        # Solve (X^T * W * X + lambda * I) * theta = X^T * W * Y
+        alpha_t, beta_t = np.linalg.solve(Xt_W @ X_mat + reg_matrix, Xt_W @ y_win)
         alphas[t] = alpha_t
         betas[t] = beta_t
+    return pd.Series(alphas, index=x_series.index), pd.Series (betas, index=x_series.index)
 
-    return pd.Series(alphas, index=x_series.index), pd.Series(betas, index=x_series.index)
-
-
-# =====================================================================
-# STEP 3: SIGNAL GENERATION & VOLATILITY TARGETING
-# =====================================================================
-def run_stat_arb_strategy(
-        df,
-        reg_window=60,
-        z_window=30,
-        l2_penalty=2.0,
-        half_life=20,
-        entry_z=2.0,
-        exit_z=0.5,
-        stop_z=4.0,
-        target_vol=0.10,
-        tc_bps=5.0
-):
+# 3. Machine Learning features
+def eng_ml_features(df, reg_window=60, z_window=25, lookforward_horizon=5):
     """
-    Executes the full backtest pipeline with hysteresis, vol-scaling, and fees.
+    :param df:
+    :param reg_window:
+    :param z_window:
+    :param lookforward_horizon:
+    :return:
+    Creates stationary, causal features at Day T and labels whether a mean-reversion
+    trade would have been profitable over the next N days.
     """
     data = df.copy()
+    # a. Compute dynamic log-spread from custom regression curve
+    data["alpha"], data["beta"] = rolling_weighted_ridge_reg(data["Log_X"], data["Log_Y"], window=reg_window)
 
-    # 1. Estimate dynamic alpha and beta using ONLY past data at each step
-    data["alpha"], data["beta"] = rolling_weighted_ridge_regression(
-        data["Asset_X"], data["Asset_Y"],
-        window=reg_window, l2_penalty=l2_penalty, half_life=half_life
-    )
+    data["spread"] = data["Log_Y"] - (data["alpha"]+data["beta"] * data["Log_X"])
 
-    # 2. Compute the live equilibrium spread (residuals of the custom regression)
-    data["spread"] = data["Asset_Y"] - (data["alpha"] + data["beta"] * data["Asset_X"])
-
-    # 3. Compute rolling Z-score of the spread using strictly past window
-    spread_mean = data["spread"].rolling(window=z_window).mean()
-    spread_std = data["spread"].rolling(window=z_window).std()
+    # b. Rolling z-score of the spread
+    spread_mean = data["spread"].rolling(z_window).mean()
+    spread_std = data["spread"].rolling(z_window).std()
     data["z_score"] = (data["spread"] - spread_mean) / spread_std
 
-    # 4. Generate stateful trading signals with Hysteresis (Buffer Zones) and Stop-Loss
-    # +1 = Long Spread (Buy Y, Sell beta*X)
-    # -1 = Short Spread (Sell Y, Buy beta*X)
-    #  0 = Flat (In Cash)
-    n = len(data)
-    z_vals = data["z_score"].values
-    raw_signal = np.zeros(n)
-    current_pos = 0
+    # 5 ML features using only past/present data at time t
+    # 3.1. Absolute Z-Score (magnitude of mispricing)
+    data["feat_abs_z"] = data["z_score"].abs()
 
-    for t in range(n):
-        z = z_vals[t]
-        if np.isnan(z):
-            raw_signal[t] = 0
-            continue
+    # 3.2. 3-day Z-Score velocity (is the spread accelerating or turning back)
+    data["feat_z_velocity"] = data["z_score"].diff(3) * np.sign(data["z_score"])
 
-        if current_pos == 0:
-            if z < -entry_z and z > -stop_z:
-                current_pos = 1  # Spread is abnormally cheap -> Buy Spread
-            elif z > entry_z and z < stop_z:
-                current_pos = -1  # Spread is abnormally expensive -> Short Spread
-        elif current_pos == 1:
-            # Exit if spread reverts to normal (-exit_z) OR blows through stop-loss (-stop_z)
-            if z >= -exit_z or z <= -stop_z:
-                current_pos = 0
-        elif current_pos == -1:
-            # Exit if spread reverts to normal (+exit_z) OR blows through stop-loss (+stop_z)
-            if z <= exit_z or z >= stop_z:
-                current_pos = 0
+    # 3.3. Volatility regime ratio (short-term 10d vol/ long-term 60d vol)
+    vol_10 = data["spread"].diff().rolling(10).std()
+    vol_60 = data["spread"].diff().rolling(60).std()
+    data["feat_vol_regime"] = vol_10 / vol_60
 
-        raw_signal[t] = current_pos
+    # 3.4. Hedge ratio (beta) stability (10d roll std of beta)
+    # High instability means pair relationship is breaking down
+    data["feat_beta_instability"] = data["beta"].rolling(10).std()
 
-    data["signal"] = raw_signal
+    # 3.5. Spread autocorrelation (15d roll lag-1 correlation of spread changes)
+    # Negative autocorrelation means strong mean-reverting regime; Positive- trending regime
+    spread_diff = data["spread"].diff()
+    data["feat_autocorr"] = spread_diff.rolling(15).corr(spread_diff.shift(1))
 
-    # 5. Volatility Targeting (Inverse Volatility Position Sizing)
-    # Calculate daily return of 1 unit of the hedged spread pair
-    ret_x = data["Asset_X"].pct_change()
-    ret_y = data["Asset_Y"].pct_change()
+    # Target Labeling (used for training on 70% of dataset)
+    # If z_score < 0, we want spread to rise (+1). If z_score > 0 we want spread to fall (-1)
+    intended_dir = -np.sign["z_score"]
+    future_spread_change = data["spread"].shift(-lookforward_horizon) - data["spread"]
+    # Label = 1 if spread moves in mean-reverting direction over the next 'lookforward_horizon' days
+    data["ml_target"] = ((intended_dir * future_spread_change) > 0).astype(int)
 
-    # Capital allocation weights per unit of spread: 1 part Y, beta parts X
-    # We normalize by (1 + |beta|) so gross leverage before vol-scaling equals 1.0
-    gross_exposure = 1.0 + data["beta"].abs()
-    weight_y = 1.0 / gross_exposure
-    weight_x = -data["beta"] / gross_exposure
+    feature_cols = [
+        "feat_abs_z",
+        "feat_z_velocity",
+        "feat_vol_regime",
+        "feat_beta_instability",
+        "feat_autocorr"
+    ]
 
-    # Note: We lag weight_x and weight_y by 1 day when computing historical spread volatility
-    raw_pair_return = weight_y.shift(1) * ret_y + weight_x.shift(1) * ret_x
+    return data.dropna(subset=feature_cols + ["z_score"]).copy(), feature_cols
 
-    # Annualized rolling volatility of the spread (252 trading days)
-    rolling_ann_vol = raw_pair_return.rolling(window=z_window).std() * np.sqrt(252)
-
-    # Scale position size to hit 'target_vol' (cap leverage at 2.0x for safety)
-    vol_scalar = (target_vol / rolling_ann_vol).clip(upper=2.0).fillna(0.0)
-    data["sized_position"] = data["signal"] * vol_scalar
-
-    # =================================================================
-    # CRITICAL NO-LOOKAHEAD STEP: SHIFT POSITIONS BY 1 DAY (.shift(1))
-    # =================================================================
-    # A signal computed using Day T's closing prices can ONLY be executed
-    # at Day T's close / Day T+1's open, earning Day T+1's return.
-    data["exec_weight_y"] = (data["sized_position"] * weight_y).shift(1).fillna(0.0)
-    data["exec_weight_x"] = (data["sized_position"] * weight_x).shift(1).fillna(0.0)
-
-    # 6. Calculate Gross Returns, Transaction Costs, and Net Returns
-    data["gross_ret"] = data["exec_weight_y"] * ret_y + data["exec_weight_x"] * ret_x
-
-    # Turnover is the total absolute change in portfolio weights on both legs
-    turnover = data["exec_weight_y"].diff().abs().fillna(0.0) + data["exec_weight_x"].diff().abs().fillna(0.0)
-    data["tc_cost"] = turnover * (tc_bps / 10000.0)
-
-    data["net_ret"] = data["gross_ret"] - data["tc_cost"]
-    data["cum_gross"] = (1 + data["gross_ret"]).cumprod()
-    data["cum_net"] = (1 + data["net_ret"]).cumprod()
-
-    return data
-
-
-# =====================================================================
-# STEP 4: INSTITUTIONAL PERFORMANCE METRICS & VISUALIZATION
-# =====================================================================
-def evaluate_performance(data):
+# 4. 70/30 purged train/test split and ML model
+def train_ml_strategy(
+data,
+    feature_cols,
+    train_ratio=0.70,
+    lookforward_horizon=5,
+    entry_z=1.15,          # Lower entry threshold to eliminate cash drag
+    exit_z=0.25,           # Hold winners closer to full mean reversion
+    stop_z=3.75,           # Stop-loss for structural breaks
+    ml_prob_threshold=0.52,# Minimum ML win probability required to take a trade
+    target_vol=0.20,       # 20% annualized target volatility
+    max_leverage=2.5,      # Max gross leverage (standard Reg-T margin)
+    tc_bps=4.0             # 4 bps transaction cost per trade
+):
     """
-    Computes key quant interview metrics: Sharpe, Sortino, Max Drawdown, Calmar.
+    Trains a Random Forest Meta-Model on the first 70% of data (with purge gap)
+    and evaluates performance on the 30% latest test set.
     """
-    valid = data.dropna(subset=["z_score"]).copy()
-    net_r = valid["net_ret"]
-
-    ann_ret = net_r.mean() * 252
-    ann_vol = net_r.std() * np.sqrt(252)
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
-
-    # Sortino Ratio (only penalizes downside volatility)
-    downside_r = net_r[net_r < 0]
-    downside_vol = downside_r.std() * np.sqrt(252)
-    sortino = ann_ret / downside_vol if downside_vol > 0 else 0.0
-
-    # Maximum Drawdown
-    equity = (1 + net_r).cumprod()
-    running_max = equity.cummax()
-    drawdown = (equity - running_max) / running_max
-    max_dd = drawdown.min()
-
-    calmar = ann_ret / abs(max_dd) if max_dd < 0 else 0.0
-
-    print("=== BACKTEST PERFORMANCE SUMMARY (NET OF FEES) ===")
-    print(f"Annualized Return : {ann_ret:.2%}")
-    print(f"Annualized Vol    : {ann_vol:.2%}")
-    print(f"Sharpe Ratio      : {sharpe:.2f}")
-    print(f"Sortino Ratio     : {sortino:.2f}")
-    print(f"Maximum Drawdown  : {max_dd:.2%}")
-    print(f"Calmar Ratio      : {calmar:.2f}")
-
-    # Plot results
-    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-
-    axes[0].plot(valid.index, valid["cum_gross"], label="Gross Cumulative Return", linestyle="--", alpha=0.7)
-    axes[0].plot(valid.index, valid["cum_net"], label="Net Cumulative Return (After Fees)", linewidth=2)
-    axes[0].set_title("Strategy Equity Curve (Gross vs. Net)")
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].plot(valid.index, valid["z_score"], label="Spread Z-Score", color="purple", alpha=0.8)
-    axes[1].axhline(2.0, color="red", linestyle="--", label="Entry Threshold (+/- 2.0)")
-    axes[1].axhline(-2.0, color="red", linestyle="--")
-    axes[1].axhline(0.5, color="green", linestyle=":", label="Exit Threshold (+/- 0.5)")
-    axes[1].axhline(-0.5, color="green", linestyle=":")
-    axes[1].set_title("Rolling Spread Z-Score & Hysteresis Bands")
-    axes[1].legend(loc="upper right")
-    axes[1].grid(True, alpha=0.3)
-
-    axes[2].plot(valid.index, valid["beta"], label="Dynamic Ridge Hedge Ratio (Beta)", color="teal")
-    axes[2].set_title("Custom Rolling Weighted Ridge Regression Beta")
-    axes[2].legend()
-    axes[2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.show()
-
-
-if __name__ == "__main__":
-    market_df = get_market_data(n_days=1500)
-    results_df = run_stat_arb_strategy(market_df)
-    evaluate_performance(results_df)
+    n_total = len(data)
+    split_idx = int(n_total * train_ratio)
+    
