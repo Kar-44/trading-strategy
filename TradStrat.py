@@ -18,7 +18,8 @@ def fetch_pair_data(ticker_x="XOM", ticker_y="CVX", start="2018-01-01", end="202
     raw = yf.download([ticker_x, ticker_y], start=start, end=end, auto_adjust=True, progress=False)
 
     # Extract Close prices from different yfinance versions, removing missing values to prevent errors
-    close_prices = raw["Close"] if "Close" in raw else raw df = pd.DataFrame({
+    close_prices = raw["Close"] if "Close" in raw else raw
+    df = pd.DataFrame({
         "Price_X": close_prices[ticker_x],
         "Price_Y": close_prices[ticker_y]
     }).dropna()
@@ -118,7 +119,7 @@ def eng_ml_features(df, reg_window=60, z_window=25, lookforward_horizon=5):
 
     # Target Labeling (used for training on 70% of dataset)
     # If z_score < 0, we want spread to rise (+1). If z_score > 0 we want spread to fall (-1)
-    intended_dir = -np.sign["z_score"]
+    intended_dir = -np.sign(data["z_score"])
     future_spread_change = data["spread"].shift(-lookforward_horizon) - data["spread"]
     # Label = 1 if spread moves in mean-reverting direction over the next 'lookforward_horizon' days
     data["ml_target"] = ((intended_dir * future_spread_change) > 0).astype(int)
@@ -155,7 +156,7 @@ data,
     split_idx = int(n_total * train_ratio)
 
     # Purging boundary makes is so that train set does not leak into the test set.
-    train_df = data.ilox[: split_idx - lookforward_horizon]
+    train_df = data.iloc[: split_idx - lookforward_horizon]
 
     X_train = train_df[feature_cols].values
     y_train = train_df["ml_target"].values
