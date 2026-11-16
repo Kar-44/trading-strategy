@@ -96,6 +96,8 @@ def eng_ml_features(df, reg_window=60, z_window=25, lookforward_horizon=5):
     spread_std = data["spread"].rolling(z_window).std()
     data["z_score"] = (data["spread"] - spread_mean) / spread_std
 
+    data["spread_std"] = spread_std
+    data["pair_corr"] = data["Log_X"].diff().rolling(60).corr(data["Log_Y"].diff())
     # 5 ML features using only past/present data at time t
     # 3.1. Absolute Z-Score (magnitude of mispricing)
     data["feat_abs_z"] = data["z_score"].abs()
@@ -134,6 +136,67 @@ def eng_ml_features(df, reg_window=60, z_window=25, lookforward_horizon=5):
 
     return data.dropna(subset=feature_cols + ["z_score"]).copy(), feature_cols
 
+def run_signal(z_vals,
+               spread_vals,
+               std_vals,
+               corr_vals,
+               prob_vals,
+               entry_z,
+               exit_z,
+               stop_z,
+               prob_thr=None,
+               max_hold=15,
+               adverse_mult=2.0,
+               min_corr=0.5,
+               cooldown=10,
+               use_guards=True):
+    """
+    State machine for one strategy. prob_thr=None -> no ML filter, flat size 1.0.
+    Guards: pair-correlation gate, fixed-level adverse stop, time stop, cooldown.
+    """
+    n = len(z_vals)
+    sig = np.zeros(n)
+    pos, held = 0.0, 0
+    entry_spread, entry_std = 0.0, 0.0
+    cool_until = -1
+
+    for t in range(n):
+        z = z_vals[t]
+        healthy = (not use_guards) or (corr_vals[t] >= min_corr)  # NaN -> blocked
+
+        if pos != 0.0:
+            held += 1
+            d = np.sign(pos)  # +1 long spread, -1 short spread
+
+            reverted = (d > 0 and z >= -exit_z) or (d < 0 and z <= exit_z)
+            z_stop = abs(z) >= stop_z
+            # Spread moved against us by more than adverse_mult entry-std
+            adverse = d * (spread_vals[t] - entry_spread) <= -adverse_mult * entry_std
+            timed_out = held >= max_hold
+            broken = not healthy
+
+            if reverted:
+                pos = 0.0
+            elif z_stop or (use_guards and (adverse or timed_out or broken)):
+                pos = 0.0
+                if use_guards:
+                    cool_until = t + cooldown
+        else:
+            if t > cool_until and healthy:
+                if prob_thr is None or prob_vals[t] >= prob_thr:
+                    d = 0.0
+                    if -stop_z < z < -entry_z:
+                        d = 1.0
+                    elif entry_z < z < stop_z:
+                        d = -1.0
+                    if d != 0.0:
+                        size = 1.0 if prob_thr is None else float(
+                            np.clip(1.0 + (prob_vals[t] - prob_thr) * 4.0, 0.8, 1.6))
+                        pos = d * size
+                        entry_spread, entry_std, held = spread_vals[t], std_vals[t], 0
+        sig[t] = pos
+    return sig
+
 # 4. 70/30 purged train/test split and ML model
 def train_ml_strategy(
 data,
@@ -146,7 +209,12 @@ data,
     ml_prob_threshold=0.52,# Minimum ML win probability required to take a trade
     target_vol=0.20,       # 20% annualized target volatility
     max_leverage=2.5,      # Max gross leverage (standard Reg-T margin)
-    tc_bps=4.0             # 4 bps transaction cost per trade
+    tc_bps=4.0,             # 4 bps transaction cost per trade
+    use_guards=True,      # NEW
+    max_hold=15,          # NEW: days
+    adverse_mult=2.0,     # NEW: entry-std units
+    min_corr=0.5,         # NEW: 60d return correlation floor
+    cooldown=10           # NEW: days after a forced exit
 ):
     """
     Trains a Random Forest Meta-Model on the first 70% of data (with purge gap)
@@ -182,46 +250,19 @@ data,
     # Trading loop (Baseline vs ML-enhanced)
     z_vals = data["z_score"].values
     prob_vals = data["ml_win_prob"].values
+    spread_vals = data["spread"].values
+    std_vals = data["spread_std"].values
+    corr_vals = data["pair_corr"].values
 
-    ml_signal = np.zeros(n_total)
-    base_signal = np.zeros(n_total)
+    guard_kw = dict(max_hold=max_hold, adverse_mult=adverse_mult,
+                    min_corr=min_corr, cooldown=cooldown, use_guards=use_guards)
 
-    curr_ml = 0.0
-    curr_base = 0.0
-
-    for t in range(n_total):
-        z = z_vals[t]
-        prob = prob_vals[t]
-
-        # Baseline strategy (fixed z= 2.0, no ML)
-        if curr_base == 0:
-            if -stop_z < z < -2.0:
-                curr_base = 1.0
-            elif 2.0 < z < stop_z:
-                curr_base = -1.0
-        elif curr_base == 1.0 and (z >= -0.5 or z <= -stop_z):
-            curr_base = 0.0
-        elif curr_base == -1.0 and (z <= -0.5 or z >= stop_z):
-            curr_base = 0.0
-        base_signal[t] = curr_base
-
-        # ML-enhanced strategy (lower entry Z, ML filter, Conviction sizing)
-        if curr_ml == 0:
-            if -stop_z < z < -entry_z and prob >= ml_prob_threshold:
-                # Scale conviction between 0.8 and 1.6 based on ML confidence
-                conviction = np.clip(1.0 + (prob - ml_prob_threshold) * 4.0, 0.8, 1.6)
-                curr_ml = 1.0 * conviction
-            elif entry_z < z < stop_z and prob >= ml_prob_threshold:
-                conviction = np.clip(1.0 + (prob - ml_prob_threshold) * 4.0, 0.8, 1.6)
-                curr_ml = -1.0 * conviction
-        elif curr_ml > 0 and (z >= -exit_z or z <= -stop_z):
-            curr_ml == 0.0
-        elif curr_ml < 0 and (z <= -exit_z or z >= stop_z):
-            curr_ml = 0.0
-        ml_signal[t] = curr_ml
-
-    data["base_signal"] = base_signal
-    data['ml_signal'] = ml_signal
+    data["base_signal"] = run_signal(z_vals, spread_vals, std_vals, corr_vals, prob_vals,
+                                     entry_z=2.0, exit_z=0.5, stop_z=stop_z,
+                                     prob_thr=None, **guard_kw)
+    data["ml_signal"] = run_signal(z_vals, spread_vals, std_vals, corr_vals, prob_vals,
+                                   entry_z=entry_z, exit_z=exit_z, stop_z=stop_z,
+                                   prob_thr=ml_prob_threshold, **guard_kw)
 
     # Portfolio weights, volatility scaling and strict 1d lag
     ret_x = data["Price_X"].pct_change().fillna(0.0)
@@ -310,7 +351,7 @@ def eval_and_plot(data, split_idx):
     plt.show()
 
 if __name__ == "__main__":
-    raw_df = fetch_pair_data(ticker_x="XOM", ticker_y="CVX")
+    raw_df = fetch_pair_data(ticker_x="GOOGL", ticker_y="META")
     feat_df, feat_cols = eng_ml_features(raw_df)
     bt_df, split_point = train_ml_strategy(feat_df, feat_cols)
     eval_and_plot(bt_df, split_point)
