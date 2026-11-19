@@ -50,3 +50,6 @@ Sharpe Ratio      : 0.61
 Max Drawdown      : -11.42%
 ```
 
+## Notice
+
+This project was built for research and education purposes only. It's not to be used as a financial advice or tool.
